@@ -23,6 +23,10 @@ module Network.MQTT.Bridge.Types
   , MsgNum(..)
   , Metrics(..)
   , FuncSeries
+  , ExtConnType(..)
+  , ExtMsgType(..)
+  , ExtIOer(..)
+  , ExtConnPool(..)
 
   , parseConfig
   , mkLogger
@@ -40,12 +44,14 @@ import           Data.Maybe             (isNothing, fromJust)
 import           Data.Text
 import           Data.Text.Encoding
 import qualified Data.ByteString.Lazy   as BL
+import           Data.Hashable
 import           System.IO
 import           System.Metrics.Counter
 import           Text.Printf
 import           Data.Time
 import           Control.Exception
 import           Control.Monad
+import           Control.Monad.Reader
 import           Control.Monad.State
 import           Control.Monad.Except
 import           Control.Monad.Writer
@@ -141,11 +147,12 @@ data Broker = Broker
 -- | Config of the bridge, it can be described by
 -- brokers it (will) connect to.
 data Config = Config
-  { brokers     :: [Broker]
-  , logToStdErr :: Bool
-  , logFile     :: FilePath
-  , logLevel    :: Priority
-  , msgFuncs    :: [(String, MessageFuncs)]
+  { brokers       :: [Broker]
+  , logToStdErr   :: Bool
+  , logFile       :: FilePath
+  , logLevel      :: Priority
+  , msgFuncs      :: [(String, MessageFuncs)]
+  , retryInterval :: Int
   } deriving (Show, Generic, FromJSON, ToJSON)
 
 configP :: Parser String
@@ -198,6 +205,9 @@ data Bridge = Bridge
   , broadcastChan :: TChan Message -- ^ Broadcast channel
   , functions     :: TVar [(String, MessageFuncs, Message -> FuncSeries Message)] -- ^ Processing functions
   , counters      :: MsgCounter  -- ^ Counter of messages
+  , extConnPool   :: TVar ExtConnPool -- ^ Handles used by message processing functions
+  , extThreadsChan :: TChan (String, ExtConnType)
+  --, extIOer       :: ExtIOer
   }
 
 -- | Environment. It describes the state of system.
@@ -208,11 +218,54 @@ data Env = Env
   }
 
 
+---------------------------------------------
+data ExtConnType = ExtConnHandle Handle
+              -- | ...
+              -- | ...
+
+data ExtMsgType = ExtMessage Message
+                | ExtString  String
+             -- | ...
+                deriving (Show, Generic, FromJSON, ToJSON)
+
+data ExtIOer = ExtIOer
+  { extIOConn  :: ExtConnType
+  , extIOChan  :: TChan ExtMsgType
+  }
+
+type ExtConnPool = Map String ExtIOer
+
+--extIOProcess :: extIOer ->
+
+
+{-
+logProcess :: Logger -> IO ()
+logProcess Logger{..} = do
+  time <- getCurrentTime
+  (h'  :: Either SomeException Handle) <- try $ openFile loggerFile WriteMode
+  (dh' :: Either SomeException Handle) <- case h' of
+    Left _ -> try $ openFile (show time ++ ".log") WriteMode
+    Right _ -> return h'
+
+  forever $ do
+    log <- atomically $ readTChan loggerChan
+    let s = show log
+    when loggerToStdErr (hPutStrLn stderr s)
+    case h' <> dh' of
+      Right h -> hPutStrLn h s
+      _       -> return ()
+-}
+---------------------------------------------
+
+
+
+
+
 -- | Functions for processing messages. New members may be added at any time.
 data MessageFuncs = SaveMsg FilePath
                   | ModifyField [Text] Value
                   | ModifyTopic Topic Topic
-                  deriving (Show, Generic, FromJSON, ToJSON)
+                  deriving (Show, Generic, FromJSON, ToJSON, Hashable)
 
 ----------------------------------------------------------------------------------------------
 -- | Priority of log
@@ -299,11 +352,12 @@ data Metrics = Metrics
 
 ----------------------------------------------------------------------------------------------
 -- | Monad that describes message processing stage.
-type FuncSeries = ExceptT SomeException (StateT Int (WriterT String IO))
+type FuncSeries = ExceptT SomeException (StateT Int (WriterT String (ReaderT Env IO)))
 
 -- | Run the monad to pass a message through a series of functions.
 runFuncSeries :: Message
+  -> Env
   -> [Message -> FuncSeries Message]
   -> IO ((Either SomeException Message, Int), String)
-runFuncSeries msg fs = runWriterT $ runStateT
-                                    (runExceptT $ foldM (\acc f -> f acc) msg fs) 0
+runFuncSeries msg env fs = runReaderT (runWriterT $ runStateT
+                                    (runExceptT $ foldM (\acc f -> f acc) msg fs) 0) env

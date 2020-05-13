@@ -33,6 +33,7 @@ dependencies:
 - bytestring
 - containers
 - unordered-containers
+- hashable
 - network
 - stm
 - mtl

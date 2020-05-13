@@ -21,13 +21,17 @@ module Network.MQTT.Bridge.Extra
 import           Data.Text
 import           Data.Text.Encoding
 import           Text.Printf
-import qualified Data.List            as L
-import qualified Data.HashMap.Strict  as HM
-import qualified Data.ByteString.Lazy as BL
-import qualified Data.ByteString           as BS
+import qualified Data.List                 as L
+import qualified Data.Map                  as Map
+import qualified Data.HashMap.Strict       as HM
 import qualified Data.ByteString.Lazy      as BL
+import qualified Data.ByteString           as BS
 import qualified Data.ByteString.Char8     as BSC (hPutStrLn)
+import           Control.Monad
+import           Control.Concurrent
+import           Control.Concurrent.STM
 import           Control.Monad.State
+import           Control.Monad.Reader
 import           Control.Monad.Writer
 import           Control.Monad.Except
 import           System.IO
@@ -39,6 +43,7 @@ import           Network.MQTT.Bridge.Types
 
 
 -- | Check if there exists a topic in the list that the given one can match.
+{-# INLINABLE existMatch #-}
 existMatch :: Topic -> [Topic] -> Bool
 existMatch t ts =  True `elem` [pat `match` t | pat <- ts]
 
@@ -51,7 +56,17 @@ parseMsgFuncs (ModifyTopic pat t') = modifyTopic pat t'
 -- | Save a message to file. For any type of message.
 saveMsg :: FilePath -> Message -> FuncSeries Message
 saveMsg f msg = do
-  liftIO $ catchError (appendFile f (show msg ++ "\n")) (\e -> print e)
+  env@(Env Bridge{..} _ logger) <- ask
+
+  -- EXT
+  --liftIO $ catchError (appendFile f (show msg ++ "\n")) (\e -> print e)
+  pool <- liftIO . readTVarIO $ extConnPool
+  let ioer' = Map.lookup f pool
+  case ioer' of
+    Nothing  -> return ()
+    Just (ExtIOer _ ch) -> do
+      liftIO . atomically $ writeTChan ch (ExtMessage msg)
+  --
   modify (+ 1)
   log <- liftIO $ mkLog INFO $ printf "Saved to %s: [%s].\n" f (show msg)
   return msg
@@ -119,17 +134,21 @@ modifyTopic pat t' msg = do
 
 
 -- | Compose a mountpoint with a topic
+{-# INLINABLE composeMP #-}
 composeMP :: Topic -> Topic -> Topic
 composeMP = append
 
+{-# INLINABLE blToText #-}
 blToText :: BL.ByteString -> Text
 blToText = decodeUtf8 . BL.toStrict
 
+{-# INLINABLE textToBL #-}
 textToBL :: Text -> BL.ByteString
 textToBL = BL.fromStrict . encodeUtf8
 
 -- | Insert a element to a certain position of a list.
 -- If the index is out of bound, it will be appended to the end.
+{-# INLINABLE insertToN #-}
 insertToN :: Int -> a -> [a] -> [a]
 insertToN n x xs
   | n < 0 || n > L.length xs = xs ++ [x]
@@ -137,6 +156,7 @@ insertToN n x xs
 
 -- | Delete a element at certain position of a list.
 -- If the index is out of bound, the list will not be modified.
+{-# INLINABLE deleteAtN #-}
 deleteAtN :: Int -> [a] -> [a]
 deleteAtN n xs
   | n < 0 || n > L.length xs = xs
@@ -145,12 +165,6 @@ deleteAtN n xs
     in case p2 of
          []     -> p1
          (_:ys) -> p1 ++ ys
-
-{-
--- | Remove elements of a list from another one.
-subtractList :: (Eq a) => [a] -> [a] -> [a]
-subtractList l s = L.filter (\x -> not (x `L.elem` s)) l
--}
 
 -- | Forward message to certain broker. Broker-dependent and will be
 -- replaced soon.

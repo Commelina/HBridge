@@ -63,6 +63,7 @@ myConfig  = Config
                , ("ModifyTopic_1", ModifyTopic "office/#" "mountpoint_on_recv_office/office/light")
                , ("saveMsg_2", SaveMsg "save2.txt")
                ]
+  , retryInterval = 2000000
   }
 
 -- | Write config to file.

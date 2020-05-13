@@ -38,7 +38,7 @@ httpServer Env{..} = getFuncs
     getFuncs :: Handler [String]
     getFuncs = do
       funcs <- liftIO . readTVarIO $ functions envBridge
-      return ["[ " ++ n ++ " ]: " ++ show f'| (n,f',f) <- funcs]
+      return ["[" ++ n ++ "]: " ++ show f'| (n,f',f) <- funcs]
 
     postFuncs :: Message -> Handler String
     postFuncs msg = do

@@ -17,7 +17,7 @@ import qualified Data.List               as L
 import           Data.Map                as Map
 import           Data.Maybe              (isNothing, fromJust)
 import           Data.Either             (isLeft, isRight)
-import           Data.Tuple.Extra        (fst3, snd3, thd3)
+import           Data.Tuple.Extra        (thd3)
 import           Data.Time
 import           System.IO
 import           System.Metrics.Counter
@@ -81,27 +81,40 @@ getMQTTClient callback = do
 -- | Create basic bridge environment without connections created.
 newEnv1 :: ReaderT Config IO Env
 newEnv1 = do
-  time                      <- liftIO getCurrentTime
-  [mqrc,mqfc,tctlc,trc,tfc] <- liftIO $ replicateM 5 new
-  conf@(Config bs _ _ _ fs) <- ask
-  logger                    <- liftIO $ mkLogger conf
-  ch                        <- liftIO newBroadcastTChanIO
-  activeMCs                 <- liftIO $ newTVarIO Map.empty
-  activeTCPs                <- liftIO $ newTVarIO Map.empty
-  funcs                     <- liftIO $ newTVarIO [(n,f,parseMsgFuncs f) | (n, f) <- fs]
+  time                        <- liftIO getCurrentTime
+  [mqrc,mqfc,tctlc,trc,tfc]   <- liftIO $ replicateM 5 new
+  conf@(Config bs _ _ _ fs _) <- ask
+  logger                      <- liftIO $ mkLogger conf
+  ch                          <- liftIO newBroadcastTChanIO
+  activeMCs                   <- liftIO $ newTVarIO Map.empty
+  activeTCPs                  <- liftIO $ newTVarIO Map.empty
+  funcs                       <- liftIO $ newTVarIO [(n,f,parseMsgFuncs f) | (n, f) <- fs]
+  pool                        <- liftIO $ newTVarIO Map.empty
+  threadCh                    <- liftIO $ newTChanIO
+
+  liftIO $ mapM_ (mapFun threadCh) fs
 
   let rules = Map.fromList [(brokerName b, (brokerFwds b, brokerSubs b)) | b <- bs]
       mps   = Map.fromList [(brokerName b, brokerMount b) | b <- bs]
       cnts  = MsgCounter mqrc mqfc tctlc trc tfc
+
   return $ Env
-    { envBridge = Bridge time activeMCs activeTCPs rules mps ch funcs cnts
+    { envBridge = Bridge time activeMCs activeTCPs rules mps ch funcs cnts pool threadCh
     , envConfig = conf
     , envLogger = logger
     }
+  where
+    mapFun ch (_,f) = do
+      case f of
+        SaveMsg file -> do
+          h <- openFile file AppendMode
+          atomically $ writeTChan ch (file,ExtConnHandle h)
+        _ -> return ()
+
 
 
 callbackFunc :: Env -> LowLevelCallbackType
-callbackFunc Env{..} n mc pubReq = do
+callbackFunc env@Env{..} n mc pubReq = do
   logging envLogger INFO $ printf "Received    [%s]." (show $ PubPkt pubReq n)
   inc (mqttRecvCounter (counters envBridge))
 
@@ -111,7 +124,7 @@ callbackFunc Env{..} n mc pubReq = do
       mps = mountPoints envBridge
       funcs = thd3 <$> funcs'
       mp = fromJust (Map.lookup n mps)
-  ((msg', s), l) <- runFuncSeries (PubPkt pubReq n) funcs
+  ((msg', s), l) <- runFuncSeries (PubPkt pubReq n) env funcs
   case msg' of
     Left e      -> logging envLogger WARNING $ printf "Message transformation failed: [%s]."
                                                       (show $ PubPkt pubReq n)

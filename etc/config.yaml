@@ -1,5 +1,7 @@
 logFile: test.log
 logLevel: WARNING
+logToStdErr: true
+retryInterval: 4000000
 msgFuncs:
 - - SaveMsg_1
   - tag: SaveMsg
@@ -47,4 +49,3 @@ brokers:
   brokerFwds:
   - home/ac/temp
   connectType: TCPConnection
-logToStdErr: true

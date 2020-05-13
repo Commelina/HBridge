@@ -50,6 +50,10 @@ main = do
 
       async (run 8999 (apiApp env))
 
+      forkFinally (maintainExt env)
+        (\_ -> logging logger WARNING "Ext connection maintaining thread failed.")
+
+
       initMCs <- readTVarIO (activeMQTT bridge)
       logging logger INFO $ "Connected to brokers:\n" ++ L.intercalate "\n" (Map.keys initMCs)
       initTCPs <- readTVarIO (activeTCP bridge)
@@ -85,7 +89,7 @@ maintainConns warnFlag runProcess env@(Env Bridge{..} conf logger) = do
 
   -- MQTT
   when (not (L.null missedMQNs) && warnFlag) $
-    logging logger WARNING $ printf "Missed MQTT connections: %s . Retrying..." (show missedMQNs)
+    logging logger WARNING $ printf "Lost MQTT connections: %s . Retrying..." (show missedMQNs)
 
   tups1' <- mapM (runReaderT (runExceptT (getMQTTClient (callbackFunc env)))) missedMQs
   mapM_ (\(Left e) -> logging logger WARNING e) (L.filter isLeft tups1')
@@ -106,7 +110,31 @@ maintainConns warnFlag runProcess env@(Env Bridge{..} conf logger) = do
   atomically $ modifyTVar activeTCP (Map.union (Map.fromList tups2))
   when runProcess $ mapM_ (`processTCP` env) tups2
 
-  threadDelay 2000000
+  threadDelay (retryInterval conf)
+
+
+---------------------------------------------
+maintainExt :: Env -> IO ()
+maintainExt env@(Env Bridge{..} conf logger) = do
+  (f, h') <- atomically $ readTChan extThreadsChan
+  case h' of
+    ExtConnHandle h -> do
+      forkFinally (processHandle f h)
+        (\e -> logging logger WARNING $ printf "Thread related to %s ended.\n" f)
+      return ()
+    _ -> return ()
+
+  where
+    processHandle f h = do
+      pool <- readTVarIO extConnPool
+      let (ExtIOer _ ch) = (Map.!) pool f
+      forever $ do
+        msg <- atomically $ readTChan ch
+        hPutStrLn h (show msg)
+        logging logger WARNING $ printf "Written %s." (show msg)
+
+
+
 
 
 -- | Same as 'runMQTT', for symmetry only.
@@ -173,7 +201,7 @@ processTCP tup@(n, h) env@(Env Bridge{..} _ logger) = do
 runTCP :: (BrokerName, Handle)
     -> Env
     -> IO ()
-runTCP (n, h) (Env Bridge{..} _ logger) = do
+runTCP (n, h) env@(Env Bridge{..} _ logger) = do
     ch <- atomically $ dupTChan broadcastChan
     race (receiving ch logger) (forwarding ch logger)
     return ()
@@ -191,7 +219,7 @@ runTCP (n, h) (Env Bridge{..} _ logger) = do
           when (t `existMatch` fwds) $ do
             funcs' <- readTVarIO functions
             let funcs = thd3 <$> funcs'
-            ((msg', s), l) <- runFuncSeries (fromJust msg) funcs
+            ((msg', s), l) <- runFuncSeries (fromJust msg) env funcs
             case msg' of
               Left e -> logging logger WARNING "[TCP]  Message transformation failed."
               Right msg'' -> atomically $ do
@@ -211,6 +239,12 @@ runTCP (n, h) (Env Bridge{..} _ logger) = do
           inc (tcpCtlRecvCounter counters)
           let f' = SaveMsg f
           atomically $ modifyTVar functions (insertToN i (n,f',saveMsg f))
+          -- EXT
+          h <- openFile f AppendMode
+          ch <- newTChanIO
+          atomically $ modifyTVar extConnPool (Map.insert f (ExtIOer (ExtConnHandle h) ch))
+          atomically $ writeTChan extThreadsChan (f, (ExtConnHandle h))
+          --
           logging logger INFO $ printf "[TCP]  Function %s : save message to file %s." n f
 
         Just (InsertModifyTopic n i t t') -> do
@@ -228,6 +262,13 @@ runTCP (n, h) (Env Bridge{..} _ logger) = do
         Just (DeleteFunc i) -> do
           inc (tcpCtlRecvCounter counters)
           atomically $ modifyTVar functions (deleteAtN i)
+          -- EXT
+          funcs <- readTVarIO functions
+          when (i >= 0 && i < L.length funcs) $ do
+            case funcs !! i of
+              (n, (SaveMsg f), _) -> atomically $ modifyTVar extConnPool (Map.delete f)
+              _                   -> return ()
+          --
           logging logger INFO $ printf "[TCP]  Function : delete the %d th function." i
 
         _                   -> return ()
